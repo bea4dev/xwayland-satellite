@@ -505,7 +505,7 @@ impl<C: XConnection> TestFixture<C> {
         TestObject<WlOutput>,
         wayland_server::protocol::wl_output::WlOutput,
     ) {
-        self.testwl.new_output(x, y);
+        self.testwl.new_output();
         self.run();
         self.run();
         let mut events = std::mem::take(&mut *self.registry.data.events.lock().unwrap());
@@ -530,7 +530,7 @@ impl<C: XConnection> TestFixture<C> {
         );
         self.run();
         self.run();
-        (output, self.testwl.finalize_output())
+        (output, self.testwl.finalize_output(x, y))
     }
 
     fn remove_output(&mut self, output_s: wayland_server::protocol::wl_output::WlOutput) {
@@ -1056,7 +1056,7 @@ fn pass_through_globals() {
     use wayland_client::protocol::wl_output::WlOutput;
 
     let mut f = TestFixture::new();
-    f.testwl.new_output(0, 0);
+    f.testwl.new_output();
     f.testwl.enable_xdg_output_manager();
     f.run();
     f.run();
@@ -1350,6 +1350,35 @@ fn window_group_properties() {
 
     assert_eq!(data.toplevel().title, Some("window".into()));
     assert_eq!(data.toplevel().app_id, Some("class".into()));
+}
+
+#[test]
+fn splash_window_fixed_size() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let splash = Window::new(1);
+    let (buffer, surface) = comp.create_surface();
+    let dims = WindowDims {
+        x: 0,
+        y: 0,
+        width: 400,
+        height: 300,
+    };
+    let data = WindowData {
+        mapped: false,
+        dims,
+        fullscreen: false,
+    };
+    f.new_window(splash, false, data);
+    f.satellite
+        .set_window_role(splash, crate::xstate::WindowRole::Splash);
+    f.map_window(&comp, splash, &surface.obj, &buffer);
+    f.run();
+
+    let id = f.testwl.last_created_surface_id().unwrap();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let toplevel = data.toplevel();
+    assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 400, y: 300 }));
+    assert_eq!(toplevel.max_size, Some(testwl::Vec2 { x: 400, y: 300 }));
 }
 
 trait SelectionTest {
@@ -1717,6 +1746,7 @@ fn popup_no_focus_input_hint_wm_take_focus() {
 #[track_caller]
 fn check_output_position_event(output: &TestObject<WlOutput>, pos: (i32, i32)) {
     let mut geo = None;
+    let mut done = false;
     let events = std::mem::take(&mut *output.data.events.lock().unwrap());
     log::debug!("events: {events:?}");
     for event in events {
@@ -1725,19 +1755,16 @@ fn check_output_position_event(output: &TestObject<WlOutput>, pos: (i32, i32)) {
                 geo = Some((x, y));
             }
             wl_output::Event::Done => {
-                if let Some(geo) = geo {
-                    assert_eq!(geo, pos);
-                    return;
-                }
+                done = true;
             }
             _ => {}
         }
     }
-    if geo.is_none() {
+    assert!(done, "Did not receive a done event");
+    let Some(geo) = geo else {
         panic!("Did not receive any geometry events");
-    } else {
-        panic!("Did not receive a done event");
-    }
+    };
+    assert_eq!(geo, pos);
 }
 
 #[track_caller]
@@ -1802,6 +1829,7 @@ fn output_offset_multi_output() {
 
     let (output_obj_2, _) = f.new_output(0, 1000);
     f.run();
+    f.run();
     check_output_position_event(&output_obj_1, (1000, 0));
     check_output_position_event(&output_obj_2, (0, 1000));
 
@@ -1825,18 +1853,18 @@ fn output_offset_multi_output_xdg() {
     let man = f.enable_xdg_output();
 
     let (output_obj_1, output_1) = f.new_output(0, 0);
+    let output_xdg_1 = f.create_xdg_output(&man, output_obj_1.obj.clone());
     f.run();
     std::mem::take(&mut *output_obj_1.data.events.lock().unwrap());
-    let output_xdg_1 = f.create_xdg_output(&man, output_obj_1.obj.clone());
     f.testwl.move_xdg_output(&output_1, 1000, 0);
     f.run();
     f.run();
     check_output_position_event_xdg(&output_xdg_1, &output_obj_1, (0, 0), true);
 
     let (output_obj_2, output_2) = f.new_output(1000, 1000);
+    let output_xdg_2 = f.create_xdg_output(&man, output_obj_2.obj.clone());
     f.run();
     std::mem::take(&mut *output_obj_2.data.events.lock().unwrap());
-    let output_xdg_2 = f.create_xdg_output(&man, output_obj_2.obj.clone());
     f.testwl.move_xdg_output(&output_2, 0, 1000);
     f.run();
     f.run();
@@ -1864,6 +1892,7 @@ fn output_offset_remove_output() {
     let (output_ext_c, output_ext) = f.new_output(0, 0);
     let (output_main_c, _) = f.new_output(1000, 500);
     f.run();
+    f.run();
 
     check_output_position_event(&output_ext_c, (0, 0));
     check_output_position_event(&output_main_c, (1000, 500));
@@ -1882,6 +1911,19 @@ fn remove_all_outputs() {
     f.run();
 
     f.remove_output(output);
+    f.run();
+}
+
+#[test]
+fn late_output_scale_after_remove_output() {
+    let (mut f, _) = TestFixture::new_with_compositor();
+
+    let (_, output) = f.new_output(0, 0);
+    f.run();
+
+    f.remove_output(output.clone());
+    output.scale(2);
+    output.done();
     f.run();
 }
 
@@ -1980,7 +2022,8 @@ fn output_offset_xdg_override() {
 
     let man = f.enable_xdg_output();
     f.create_xdg_output(&man, output_obj.obj.clone());
-    // testwl inits xdg output position to 0, and it should take priority over wl_output position
+    f.testwl.move_xdg_output(&output, 0, 0);
+    f.run();
     test_position(&f, 0, 0);
 
     f.testwl.move_xdg_output(&output, 1000, 22);
@@ -2059,9 +2102,9 @@ fn output_offset_negative_position_update_xdg() {
     check_output_position_event(&output, (0, 0));
 
     let (output2, output_s) = f.new_output(0, 0);
+    let xdg_output = f.create_xdg_output(&xdg, output2.obj.clone());
     f.run();
     std::mem::take(&mut *output2.data.events.lock().unwrap());
-    let xdg_output = f.create_xdg_output(&xdg, output2.obj.clone());
     f.testwl.move_xdg_output(&output_s, 0, -1000);
     f.run();
     f.run();
@@ -2626,6 +2669,36 @@ fn toplevel_size_limits_scaled() {
     let toplevel = data.toplevel();
     assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 20, y: 45 }));
     assert_eq!(toplevel.max_size, Some(testwl::Vec2 { x: 100, y: 125 }));
+
+    // Try unsetting size hints one after another
+    f.satellite.set_size_hints(
+        window,
+        super::WmNormalHints {
+            min_size: Some(WinSize {
+                width: 40,
+                height: 40,
+            }),
+            max_size: None,
+        },
+    );
+    f.run();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let toplevel = data.toplevel();
+    assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 20, y: 45 }));
+    assert_eq!(toplevel.max_size, None);
+
+    f.satellite.set_size_hints(
+        window,
+        super::WmNormalHints {
+            min_size: None,
+            max_size: None,
+        },
+    );
+    f.run();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let toplevel = data.toplevel();
+    assert_eq!(toplevel.min_size, None);
+    assert_eq!(toplevel.max_size, None);
 }
 
 #[test]
