@@ -155,6 +155,7 @@ impl Compositor {
 struct WindowData {
     mapped: bool,
     fullscreen: bool,
+    maximized: bool,
     dims: WindowDims,
 }
 #[derive(Default)]
@@ -211,6 +212,11 @@ impl super::XConnection for FakeXConnection {
     #[track_caller]
     fn set_fullscreen(&mut self, window: xcb::x::Window, fullscreen: bool) {
         self.window_mut(window).fullscreen = fullscreen;
+    }
+
+    #[track_caller]
+    fn set_maximized(&mut self, window: xcb::x::Window, maximized: bool) {
+        self.window_mut(window).maximized = maximized;
     }
 
     #[track_caller]
@@ -707,6 +713,7 @@ impl TestFixture<FakeXConnection> {
                 height: 50,
             },
             fullscreen: false,
+            maximized: false,
         };
 
         self.new_window(window, false, data);
@@ -778,6 +785,7 @@ impl TestFixture<FakeXConnection> {
             mapped: true,
             dims,
             fullscreen: false,
+            maximized: false,
         };
         self.new_window(window, true, data);
         self.map_window(comp, window, &surface.obj, &buffer);
@@ -1272,6 +1280,50 @@ fn fullscreen() {
 }
 
 #[test]
+fn maximized() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    let mut check = |state, expected| {
+        f.satellite.set_maximized(win, state);
+        f.run();
+        f.run();
+
+        let data = f.testwl.get_surface_data(id).unwrap();
+        assert_eq!(
+            data.toplevel()
+                .states
+                .contains(&xdg_toplevel::State::Maximized),
+            expected
+        );
+        // The state has to make it back to the X11 window, or the client will keep
+        // drawing itself (and its titlebar buttons) as if it were unmaximized.
+        assert_eq!(f.satellite.connection.window(win).maximized, expected);
+    };
+
+    check(SetState::Add, true);
+    check(SetState::Remove, false);
+    check(SetState::Toggle, true);
+    check(SetState::Toggle, false);
+}
+
+#[test]
+fn minimized() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let win = Window::new(1);
+    let (_, id) = f.create_toplevel(&comp, win);
+
+    assert!(!f.testwl.get_surface_data(id).unwrap().minimized);
+
+    f.satellite.minimize_window(win);
+    f.run();
+    f.run();
+
+    assert!(f.testwl.get_surface_data(id).unwrap().minimized);
+}
+
+#[test]
 fn window_title_and_class() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     let win = Window::new(1);
@@ -1328,6 +1380,7 @@ fn window_group_properties() {
             ..Default::default()
         },
         fullscreen: false,
+        maximized: false,
     };
 
     let (_, surface) = comp.create_surface();
@@ -1367,6 +1420,7 @@ fn splash_window_fixed_size() {
         mapped: false,
         dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(splash, false, data);
     f.satellite
@@ -1680,6 +1734,7 @@ fn popup_focus_on_map_with_input_hint() {
         mapped: true,
         dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(win_popup, true, data);
     f.satellite.set_win_hints(
@@ -1721,6 +1776,7 @@ fn popup_no_focus_input_hint_wm_take_focus() {
         mapped: true,
         dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(win_popup, true, data);
     f.satellite.set_win_hints(
@@ -2158,6 +2214,7 @@ fn reconfigure_popup_after_map() {
         mapped: true,
         dims: old_dims,
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(popup, true, popup_data);
     f.satellite.map_window(popup);
@@ -2386,6 +2443,7 @@ fn fullscreen_heuristic() {
                 height: 1000,
             },
             fullscreen: false,
+            maximized: false,
         };
         f.new_window(window, override_redirect, data);
         f.map_window(&comp, window, &surface.obj, &buffer);
@@ -2609,6 +2667,7 @@ fn toplevel_size_limits_scaled() {
             ..Default::default()
         },
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(window, false, data);
     f.satellite.set_size_hints(
@@ -2755,6 +2814,7 @@ fn transient_for_toplevel() {
                 ..Default::default()
             },
             fullscreen: false,
+            maximized: false,
         },
     );
 
@@ -2931,6 +2991,7 @@ fn quick_destroy_window_with_serial() {
             height: 50,
         },
         fullscreen: false,
+        maximized: false,
     };
     f.new_window(window, false, data);
     f.satellite.map_window(window);
@@ -3160,6 +3221,7 @@ fn client_side_decorations_no_global() {
             height: 50,
         },
         fullscreen: false,
+        maximized: false,
     };
 
     f.new_window(window, false, data);
