@@ -17,7 +17,7 @@ edition = "2024"
 
 [package]
 name = "xwayland-satellite"
-version = "0.8.2"
+version = "0.8.3"
 authors = ["Shawn Wallace"]
 license = "MPL-2.0"
 description = "xwayland-satellite grants rootless Xwayland integration to any Wayland compositor implementing xdg_wm_base and viewporter. This is particularly useful for compositors that (understandably) do not want to go through implementing support for rootless Xwayland themselves."
@@ -51,7 +51,7 @@ hecs = { version = "0.10.5", features = ["macros"] }
 num_enum = "0.7.4"
 tiny-skia = "0.11.4"
 ab_glyph = "0.2.32"
-fontdue = "0.9.3"
+async-channel = "2.5.0"
 
 [features]
 default = []

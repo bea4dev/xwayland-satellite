@@ -291,8 +291,13 @@ impl SurfaceEvents {
         drop(xdg);
 
         if let Some(pending) = pending {
-            let mut query = data.query::<(&SurfaceScaleFactor, &x::Window, &mut WindowData)>();
-            let (scale_factor, window, window_data) = query.get().unwrap();
+            let mut query = data.query::<(
+                &SurfaceScaleFactor,
+                &x::Window,
+                &mut WindowData,
+                &SurfaceRole,
+            )>();
+            let (scale_factor, window, window_data, role) = query.get().unwrap();
 
             let window = *window;
             let x = (pending.x.max(0) as f64 * scale_factor.0) as i32 + window_data.output_offset.x;
@@ -303,7 +308,18 @@ impl SurfaceEvents {
                 window_data.attrs.dims.width
             };
             let height = if pending.height > 0 {
-                (pending.height as f64 * scale_factor.0) as u16
+                let mut logical_height = pending.height;
+                if let SurfaceRole::Toplevel(Some(toplevel)) = role {
+                    if let Some(d) = &toplevel.decoration.satellite {
+                        let surface_width = (width as f64 / scale_factor.0).ceil() as i32;
+                        if d.will_draw_decorations(surface_width) {
+                            logical_height = (logical_height
+                                - DecorationsDataSatellite::TITLEBAR_HEIGHT)
+                                .max(DecorationsDataSatellite::TITLEBAR_HEIGHT);
+                        }
+                    }
+                }
+                (logical_height as f64 * scale_factor.0) as u16
             } else {
                 window_data.attrs.dims.height
             };
@@ -469,20 +485,7 @@ pub(super) fn update_surface_viewport(
     let size_hints = &window_data.attrs.size_hints;
 
     let width = (dims.width as f64 / scale_factor.0).ceil() as i32;
-    let mut height = dims.height;
-    if let Some(SurfaceRole::Toplevel(Some(toplevel))) = role {
-        if let Some(d) = &toplevel.decoration.satellite {
-            let surface_width = (dims.width as f64 / scale_factor.0) as i32;
-            if d.will_draw_decorations(surface_width) {
-                height = height
-                    .saturating_sub(
-                        (DecorationsDataSatellite::TITLEBAR_HEIGHT as f64 * scale_factor.0) as u16,
-                    )
-                    .max(DecorationsDataSatellite::TITLEBAR_HEIGHT as u16);
-            }
-        }
-    }
-    let height = (height as f64 / scale_factor.0).ceil() as i32;
+    let height = (dims.height as f64 / scale_factor.0).ceil() as i32;
     if width > 0 && height > 0 {
         viewport.set_destination(width, height);
     }
@@ -1316,10 +1319,11 @@ impl OutputEvent {
                 height,
                 refresh,
             } => {
-                let Ok((output, dimensions)) = state
-                    .world
-                    .query_one_mut::<(&WlOutput, &mut OutputDimensions)>(target)
-                else {
+                let Ok((output, dimensions, xdg)) = state.world.query_one_mut::<(
+                    &WlOutput,
+                    &mut OutputDimensions,
+                    Option<&XdgOutputServer>,
+                )>(target) else {
                     return;
                 };
 
@@ -1332,6 +1336,13 @@ impl OutputEvent {
                     debug!("{} dimensions: {width}x{height}", output.id());
                 }
                 output.mode(convert_wenum(flags), width, height, refresh);
+                if let Some(xdg) = xdg {
+                    if dimensions.rotated_90 {
+                        xdg.logical_size(dimensions.height, dimensions.width);
+                    } else {
+                        xdg.logical_size(dimensions.width, dimensions.height);
+                    }
+                }
             }
             Event::Scale { factor } => {
                 debug!(
@@ -1356,11 +1367,22 @@ impl OutputEvent {
                     .name(name.clone());
                 state.world.insert(target, (OutputName(name),)).unwrap();
             }
+            Event::Done {} => {
+                let Ok((output, xdg)) = state
+                    .world
+                    .query_one_mut::<(&WlOutput, Option<&XdgOutputServer>)>(target)
+                else {
+                    return;
+                };
+                if let Some(xdg) = xdg {
+                    xdg.done();
+                }
+                output.done();
+            }
             _ => simple_event_shunt! {
                 state.world.get::<&WlOutput>(target).unwrap(),
                 event: client::wl_output::Event => [
                     Description { description },
-                    Done
                 ]
             },
         }

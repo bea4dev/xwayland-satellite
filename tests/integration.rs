@@ -204,12 +204,6 @@ impl Fixture {
         let mut pollfd = [self.pollfd.clone()];
         self.testwl.dispatch();
         let timeout = timespec_from_millis(50);
-        assert!(
-            poll(&mut pollfd, Some(&timeout)).unwrap() > 0,
-            "Did not receive any events"
-        );
-        self.pollfd.clear_revents();
-        self.testwl.dispatch();
 
         while poll(&mut pollfd, Some(&timeout)).unwrap() > 0 {
             self.testwl.dispatch();
@@ -413,9 +407,12 @@ impl std::ops::Deref for Connection {
 
 impl Connection {
     fn new(display: &str) -> Self {
-        let (inner, _) =
-            xcb::Connection::connect_with_extensions(Some(display), &[xcb::Extension::XFixes], &[])
-                .unwrap();
+        let (inner, _) = xcb::Connection::connect_with_extensions(
+            Some(display),
+            &[xcb::Extension::XFixes, xcb::Extension::RandR],
+            &[],
+        )
+        .unwrap();
         // xfixes init
         let reply = inner
             .wait_for_reply(inner.send_request(&xcb::xfixes::QueryVersion {
@@ -603,10 +600,27 @@ impl Connection {
     }
 
     #[track_caller]
+    fn await_button_press(&mut self) -> x::ButtonPressEvent {
+        match self.await_event() {
+            xcb::Event::X(x::Event::ButtonPress(e)) => e,
+            other => panic!("Didn't get button press event, instead got {other:?}"),
+        }
+    }
+
+    #[track_caller]
     fn get_property_change_events(&self, window: x::Window) {
         self.send_and_check_request(&x::ChangeWindowAttributes {
             window,
             value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
+        })
+        .unwrap();
+    }
+
+    #[track_caller]
+    fn get_button_press_events(&self, window: x::Window) {
+        self.send_and_check_request(&x::ChangeWindowAttributes {
+            window,
+            value_list: &[x::Cw::EventMask(x::EventMask::BUTTON_PRESS)],
         })
         .unwrap();
     }
@@ -640,6 +654,31 @@ impl Connection {
             event_mask,
         })
         .unwrap();
+    }
+
+    #[track_caller]
+    fn get_crtc_change_events(&mut self) {
+        self.send_and_check_request(&xcb::randr::SelectInput {
+            window: self.root,
+            enable: xcb::randr::NotifyMask::CRTC_CHANGE,
+        })
+        .unwrap();
+    }
+
+    #[track_caller]
+    fn await_crtc_change_events(&mut self, count: u32) {
+        for _ in 1..=count {
+            match self.await_event() {
+                xcb::Event::RandR(xcb::randr::Event::Notify(e))
+                    if matches!(e.u(), xcb::randr::NotifyData::Cc(_)) => {}
+                other => panic!("Didn't get output change event, instead got {other:?}"),
+            }
+        }
+        assert!(
+            self.poll_for_event()
+                .expect("Failed to poll for event")
+                .is_none()
+        );
     }
 
     #[track_caller]
@@ -715,6 +754,28 @@ impl Connection {
         .value()
         .to_vec()
     }
+}
+
+#[test]
+fn dispatch_already_queued_request() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, window);
+
+    connection.set_property(window, x::ATOM_STRING, x::ATOM_WM_NAME, b"queued");
+    let timeout = timespec_from_millis(1000);
+    assert!(poll(&mut [f.pollfd.clone()], Some(&timeout)).unwrap() > 0);
+    f.wait_and_dispatch();
+    assert_eq!(
+        f.testwl
+            .get_surface_data(surface)
+            .unwrap()
+            .toplevel()
+            .title
+            .as_deref(),
+        Some("queued")
+    );
 }
 
 #[test]
@@ -1873,6 +1934,39 @@ fn negative_output_coordinates() {
 }
 
 #[test]
+fn mode_resends_logical_size() {
+    for version in 2..=3 {
+        let mut f = Fixture::new_preset(|testwl| {
+            testwl.enable_xdg_output_manager_version(version);
+        });
+        let mut connection = Connection::new(&f.display);
+        connection.get_crtc_change_events();
+
+        f.create_output(0, 0);
+        let output = f.testwl.get_output("WL-1").unwrap();
+        output.mode(wl_output::Mode::Current, 1600, 900, 60);
+        output.done();
+        f.wait_and_dispatch();
+
+        // 1 event each for zero-initializing the CRTC, setting it to the 1000x1000 default, and responding to the `Mode` event
+        connection.await_crtc_change_events(3);
+
+        let resources = connection.get_reply(&xcb::randr::GetScreenResources {
+            window: connection.root,
+        });
+        let output_reply = connection.get_reply(&xcb::randr::GetOutputInfo {
+            output: resources.outputs()[0],
+            config_timestamp: resources.config_timestamp(),
+        });
+        let crtc_reply = connection.get_reply(&xcb::randr::GetCrtcInfo {
+            crtc: output_reply.crtc(),
+            config_timestamp: resources.config_timestamp(),
+        });
+        assert_eq!((crtc_reply.width(), crtc_reply.height()), (1600, 900));
+    }
+}
+
+#[test]
 fn output_offset_xdg_matches_crtcs() {
     let mut f = Fixture::new_preset(|testwl| {
         testwl.enable_xdg_output_manager();
@@ -2362,6 +2456,7 @@ fn client_init_move() {
 
     let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
     let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+    connection.get_button_press_events(win_toplevel);
     f.testwl.move_pointer_to(surface, 10., 10.);
     let ptr = f.testwl.pointer();
     ptr.motion(10, 10.0, 10.0);
@@ -2369,6 +2464,9 @@ fn client_init_move() {
     ptr.button(10, 20, BTN_LEFT, wl_pointer::ButtonState::Pressed);
     ptr.frame();
     f.testwl.dispatch();
+    let press = connection.await_button_press();
+    assert_eq!(press.event(), win_toplevel);
+    assert_eq!(press.detail(), 1);
 
     connection.send_client_message(&x::ClientMessageEvent::new(
         win_toplevel,
@@ -2388,6 +2486,7 @@ fn client_init_resize() {
 
     let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
     let surface = f.map_as_toplevel(&mut connection, win_toplevel);
+    connection.get_button_press_events(win_toplevel);
     f.testwl.move_pointer_to(surface, 10., 10.);
     let ptr = f.testwl.pointer();
     ptr.motion(10, 10.0, 10.0);
@@ -2395,6 +2494,9 @@ fn client_init_resize() {
     ptr.button(10, 20, BTN_LEFT, wl_pointer::ButtonState::Pressed);
     ptr.frame();
     f.testwl.dispatch();
+    let press = connection.await_button_press();
+    assert_eq!(press.event(), win_toplevel);
+    assert_eq!(press.detail(), 1);
 
     connection.send_client_message(&x::ClientMessageEvent::new(
         win_toplevel,
